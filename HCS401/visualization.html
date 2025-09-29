@@ -1,0 +1,455 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hamilton Paths and Circuits Visualization</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <style>
+        body {
+            margin: 0;
+            padding: 20px;
+            font-family: Arial, sans-serif;
+        }
+        #map {
+            height: 500px;
+            border: 1px solid #ccc;
+            margin-bottom: 10px;
+        }
+        #controls {
+            margin-bottom: 10px;
+        }
+        button {
+            margin-right: 10px;
+            padding: 8px 12px;
+            background: #007bff;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        button:hover {
+            background: #0056b3;
+        }
+        button:disabled {
+            background: #6c757d;
+            cursor: not-allowed;
+        }
+        #status {
+            margin-top: 10px;
+            padding: 10px;
+            background: #f8f9fa;
+            border: 1px solid #dee2e6;
+            border-radius: 4px;
+            min-height: 20px;
+        }
+        #info {
+            margin-top: 10px;
+            font-size: 14px;
+        }
+    </style>
+</head>
+<body>
+    <h1>Hamilton Paths and Circuits: Interactive Visualization</h1>
+    <p>Click on the map to add cities (nodes). Nodes are draggable to readjust positions. Or use "Generate Random Graph" for a demo in Zimbabwe. Edges form a cycle for generated graphs (degree 2 for each vertex) and complete for manual additions. Edges are visualized using real road routes instead of straight lines. Find and animate a Hamilton path or circuit using real road routes.</p>
+    <div id="controls">
+        <button id="generate">Generate Random Graph (4-8 nodes)</button>
+        <button id="clear">Clear All</button>
+        <button id="findPath">Find Hamilton Path</button>
+        <button id="findCircuit">Find Hamilton Circuit</button>
+    </div>
+    <div id="map"></div>
+    <div id="status">Click to add cities or generate a random graph.</div>
+    <div id="info"></div>
+
+    <script>
+        // TomTom API key provided
+        const apiKey = 'dzBNWMwFlqcmHWh6cJAczdDIzGVGLBn1';
+
+        const map = L.map('map').setView([-19.0154, 29.1549], 6); // Centered on Zimbabwe
+
+        L.tileLayer('https://api.tomtom.com/map/1/tile/basic/main/{z}/{x}/{y}.png?key=' + apiKey, {
+            attribution: '&copy; <a href="https://www.tomtom.com/">TomTom</a> | Hamilton Viz by Grok'
+        }).addTo(map);
+
+        let markers = [];
+        let staticPolylines = [];
+        let pathPolylines = [];
+        let graph = []; // Adjacency matrix
+        let isAnimating = false;
+        let isManual = false;
+
+        const minLat = -22.2716118303;
+        const maxLat = -15.5077869605;
+        const latRange = maxLat - minLat;
+        const minLng = 25.2642257016;
+        const maxLng = 32.8498608742;
+        const lngRange = maxLng - minLng;
+
+        // Shuffle function
+        function shuffle(array) {
+            for (let i = array.length - 1; i > 0; i--) {
+                const j = Math.floor(Math.random() * (i + 1));
+                [array[i], array[j]] = [array[j], array[i]];
+            }
+            return array;
+        }
+
+        // Click to add marker
+        map.on('click', async function(e) {
+            if (markers.length >= 8) {
+                document.getElementById('status').innerText = 'Maximum 8 nodes for performance. Clear or generate instead.';
+                return;
+            }
+            if (markers.length === 0) isManual = true;
+            const id = markers.length;
+            const marker = L.marker(e.latlng, {
+                draggable: true,
+                icon: L.divIcon({
+                    className: 'custom-marker',
+                    html: `<div style="background:red;border-radius:50%;width:12px;height:12px;border:2px solid white;"></div>`,
+                    iconSize: [16, 16]
+                })
+            }).addTo(map).bindPopup(`City ${id + 1}`);
+            marker._id = id;
+            marker.on('dragend', async function(ev) {
+                const draggedId = ev.target._id;
+                markers[draggedId].pos = ev.target.getLatLng();
+                await nameMarker(ev.target, draggedId); // Update name if needed
+                await drawStaticEdges();
+                pathPolylines.forEach(p => map.removeLayer(p));
+                pathPolylines = [];
+                document.getElementById('status').innerText = 'Node moved. Edges updated. Re-find path/circuit if needed.';
+            });
+            markers.push({id: id, pos: e.latlng, marker: marker});
+            await nameMarker(marker, id);
+            await updateGraph();
+            updateInfo();
+            document.getElementById('status').innerText = `Added City ${id + 1}. Add more or find a path/circuit.`;
+        });
+
+        // Name marker using reverse geocoding
+        async function nameMarker(marker, id) {
+            const pos = marker.getLatLng();
+            try {
+                const res = await fetch(`https://api.tomtom.com/search/2/reverseGeocode/${pos.lat},${pos.lng}.json?key=${apiKey}`);
+                const data = await res.json();
+                if (data.addresses && data.addresses[0]) {
+                    const addr = data.addresses[0].address;
+                    const name = addr.municipality || addr.localName || addr.freeformAddress || `City ${id + 1}`;
+                    marker.bindPopup(name);
+                }
+            } catch (e) {
+                console.error(e);
+            }
+        }
+
+        // Update graph and draw static edges
+        async function updateGraph() {
+            const n = markers.length;
+            graph = Array(n).fill().map(() => Array(n).fill(false));
+            if (isManual) {
+                // Complete graph
+                for (let i = 0; i < n; i++) {
+                    for (let j = i + 1; j < n; j++) {
+                        graph[i][j] = graph[j][i] = true;
+                    }
+                }
+            } else {
+                // Cycle graph with random permutation
+                let order = Array.from({length: n}, (_, i) => i);
+                shuffle(order);
+                for (let k = 0; k < n; k++) {
+                    let i = order[k];
+                    let j = order[(k + 1) % n];
+                    graph[i][j] = graph[j][i] = true;
+                }
+            }
+            await drawStaticEdges();
+        }
+
+        async function drawStaticEdges() {
+            staticPolylines.forEach(p => map.removeLayer(p));
+            staticPolylines = [];
+            for (let i = 0; i < markers.length; i++) {
+                for (let j = i + 1; j < markers.length; j++) {
+                    if (graph[i][j]) {
+                        const from = markers[i].pos;
+                        const to = markers[j].pos;
+                        let routePoints = await fetchRoute(from, to);
+                        routePoints = routePoints.map(p => L.latLng(p.latitude, p.longitude));
+                        const poly = L.polyline(routePoints, {
+                            color: 'blue',
+                            weight: 2,
+                            opacity: 0.6
+                        }).addTo(map);
+                        staticPolylines.push(poly);
+                    }
+                }
+            }
+        }
+
+        // Generate random in Zimbabwe
+        document.getElementById('generate').onclick = async function() {
+            isManual = false;
+            map.eachLayer(layer => {
+                if (layer instanceof L.Marker || layer instanceof L.Polyline) {
+                    map.removeLayer(layer);
+                }
+            });
+            markers = [];
+            staticPolylines = [];
+            pathPolylines = [];
+            const n = 4 + Math.floor(Math.random() * 5); // 4-8
+            for (let i = 0; i < n; i++) {
+                let attempts = 0;
+                let pos;
+                let isInZimbabwe = false;
+                while (attempts < 20 && !isInZimbabwe) {
+                    const lat = minLat + Math.random() * latRange;
+                    const lng = minLng + Math.random() * lngRange;
+                    pos = L.latLng(lat, lng);
+                    try {
+                        const res = await fetch(`https://api.tomtom.com/search/2/reverseGeocode/${lat},${lng}.json?key=${apiKey}`);
+                        const data = await res.json();
+                        if (data.addresses && data.addresses[0] && data.addresses[0].address.country === 'Zimbabwe') {
+                            isInZimbabwe = true;
+                        }
+                    } catch (e) {
+                        console.error(e);
+                    }
+                    attempts++;
+                }
+                if (!isInZimbabwe) {
+                    document.getElementById('status').innerText = `Failed to generate point ${i + 1} within Zimbabwe after 20 attempts. Using fallback position.`;
+                    pos = L.latLng(-19.0154, 29.1549); // Center fallback
+                }
+                const marker = L.marker(pos, {
+                    draggable: true,
+                    icon: L.divIcon({
+                        className: 'custom-marker',
+                        html: `<div style="background:blue;border-radius:50%;width:12px;height:12px;border:2px solid white;"></div>`,
+                        iconSize: [16, 16]
+                    })
+                }).addTo(map).bindPopup(`City ${i + 1}`);
+                marker._id = i;
+                marker.on('dragend', async function(ev) {
+                    const draggedId = ev.target._id;
+                    markers[draggedId].pos = ev.target.getLatLng();
+                    await nameMarker(ev.target, draggedId); // Update name if needed
+                    await drawStaticEdges();
+                    pathPolylines.forEach(p => map.removeLayer(p));
+                    pathPolylines = [];
+                    document.getElementById('status').innerText = 'Node moved. Edges updated. Re-find path/circuit if needed.';
+                });
+                markers.push({id: i, pos: pos, marker: marker});
+                await nameMarker(marker, i);
+            }
+            await updateGraph();
+            updateInfo();
+            document.getElementById('status').innerText = `Generated ${n}-node cycle graph in Zimbabwe. Try finding a path or circuit!`;
+        };
+
+        // Clear
+        document.getElementById('clear').onclick = function() {
+            map.eachLayer(layer => {
+                if (layer instanceof L.Marker || layer instanceof L.Polyline) {
+                    map.removeLayer(layer);
+                }
+            });
+            markers = [];
+            staticPolylines = [];
+            pathPolylines = [];
+            graph = [];
+            isAnimating = false;
+            document.getElementById('status').innerText = 'Cleared. Click to add cities or generate.';
+            updateInfo();
+        };
+
+        // Find Path
+        document.getElementById('findPath').onclick = async function() {
+            if (markers.length < 2) {
+                document.getElementById('status').innerText = 'Need at least 2 nodes.';
+                return;
+            }
+            await findAndAnimate('path');
+        };
+
+        // Find Circuit
+        document.getElementById('findCircuit').onclick = async function() {
+            if (markers.length < 3) {
+                document.getElementById('status').innerText = 'Need at least 3 nodes for a circuit.';
+                return;
+            }
+            await findAndAnimate('circuit');
+        };
+
+        async function findAndAnimate(type) {
+            if (isAnimating) return;
+            isAnimating = true;
+            document.getElementById('status').innerText = 'Searching for Hamilton ' + type + '... (may take a moment)';
+            pathPolylines.forEach(p => map.removeLayer(p));
+            pathPolylines = [];
+
+            const n = markers.length;
+            let result = [];
+            for (let s = 0; s < n; s++) {
+                const visited = new Set([s]);
+                const path = [s];
+                if (type === 'circuit') {
+                    result = await findHamiltonCircuit(s, visited, path);
+                } else {
+                    result = await findHamiltonPath(s, visited, path);
+                }
+                if (result.length === n) break;
+            }
+
+            if (result.length === n) {
+                document.getElementById('status').innerText = type.charAt(0).toUpperCase() + type.slice(1) + ' found! Fetching real routes...';
+                const fullPoints = await getPathRoutes(result, type === 'circuit');
+                document.getElementById('status').innerText = type.charAt(0).toUpperCase() + type.slice(1) + ' found! Animation starting...';
+                animateTraveler(fullPoints, type);
+            } else {
+                document.getElementById('status').innerText = `No ${type} found in this graph. Try generating a new one or adding edges.`;
+            }
+            isAnimating = false;
+        }
+
+        async function findHamiltonPath(current, visited, path) {
+            if (path.length === markers.length) {
+                return path.slice();
+            }
+            for (let next = 0; next < markers.length; next++) {
+                if (!visited.has(next) && graph[current][next]) {
+                    visited.add(next);
+                    path.push(next);
+                    const res = await findHamiltonPath(next, visited, path);
+                    if (res.length === markers.length) {
+                        return res;
+                    }
+                    path.pop();
+                    visited.delete(next);
+                }
+            }
+            return [];
+        }
+
+        async function findHamiltonCircuit(current, visited, path) {
+            if (path.length === markers.length) {
+                const last = path[path.length - 1];
+                if (graph[last][path[0]]) {
+                    return path.slice();
+                } else {
+                    return [];
+                }
+            }
+            for (let next = 0; next < markers.length; next++) {
+                if (!visited.has(next) && graph[current][next]) {
+                    visited.add(next);
+                    path.push(next);
+                    const res = await findHamiltonCircuit(next, visited, path);
+                    if (res.length === markers.length) {
+                        return res;
+                    }
+                    path.pop();
+                    visited.delete(next);
+                }
+            }
+            return [];
+        }
+
+        async function getPathRoutes(pathIds, isCircuit) {
+            const len = pathIds.length;
+            let fullPoints = [];
+            for (let i = 0; i < len; i++) {
+                const nextI = (i + 1) % len;
+                if (!isCircuit && i === len - 1) break;
+                const from = markers[pathIds[i]].pos;
+                const to = markers[pathIds[nextI]].pos;
+                let routePoints = await fetchRoute(from, to);
+                routePoints = routePoints.map(p => L.latLng(p.latitude, p.longitude));
+                if (i > 0) {
+                    routePoints.shift(); // Avoid duplicate points at nodes
+                }
+                fullPoints.push(...routePoints);
+            }
+            return fullPoints;
+        }
+
+        async function fetchRoute(from, to) {
+            try {
+                const res = await fetch(`https://api.tomtom.com/routing/1/calculateRoute/${from.lat},${from.lng}:${to.lat},${to.lng}/json?key=${apiKey}&maxAlternatives=0`);
+                const data = await res.json();
+                if (data.routes && data.routes[0]) {
+                    return data.routes[0].legs.flatMap(leg => leg.points);
+                }
+            } catch (e) {
+                console.error(e);
+            }
+            // Fallback to straight line
+            return [
+                {latitude: from.lat, longitude: from.lng},
+                {latitude: to.lat, longitude: to.lng}
+            ];
+        }
+
+        function animateTraveler(fullPoints, type) {
+            if (fullPoints.length < 2) return;
+            let index = 0;
+            let progress = 0;
+            const traveler = L.marker(fullPoints[0], {
+                icon: L.divIcon({
+                    className: 'traveler',
+                    html: `<div style="background:yellow;border-radius:50%;width:20px;height:20px;border:3px solid orange;box-shadow:0 0 10px orange;"></div>`,
+                    iconSize: [24, 24],
+                    iconAnchor: [12, 12]
+                })
+            }).addTo(map);
+
+            function step() {
+                if (index >= fullPoints.length - 1) {
+                    traveler.remove();
+                    // Draw full path
+                    const poly = L.polyline(fullPoints, {
+                        color: type === 'circuit' ? 'green' : 'blue',
+                        weight: 4,
+                        opacity: 0.8
+                    }).addTo(map);
+                    pathPolylines.push(poly);
+                    return;
+                }
+
+                const from = fullPoints[index];
+                const to = fullPoints[index + 1];
+                const lat = from.lat + (to.lat - from.lat) * progress;
+                const lng = from.lng + (to.lng - from.lng) * progress;
+                traveler.setLatLng([lat, lng]);
+
+                progress += 0.015; // Adjust for speed
+                if (progress >= 1) {
+                    progress = 0;
+                    index++;
+                }
+                requestAnimationFrame(step);
+            }
+            step();
+        }
+
+        function updateInfo() {
+            const n = markers.length;
+            if (n === 0) {
+                document.getElementById('info').innerHTML = '';
+                return;
+            }
+            let edges = 0;
+            for (let i = 0; i < n; i++) {
+                for (let j = i + 1; j < n; j++) {
+                    if (graph[i][j]) edges++;
+                }
+            }
+            document.getElementById('info').innerHTML = `<strong>Graph Info:</strong> ${n} nodes, ${edges} edges. Density: ${(edges / (n * (n - 1) / 2) * 100).toFixed(1)}% ${isManual ? '(Complete graph)' : '(Cycle graph)'}`;
+        }
+    </script>
+</body>
+</html>
